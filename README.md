@@ -1,4 +1,4 @@
-# ha.mr
+# lnk.flrnh.be
 Compresses links and optimizes QR codes entirely in the browser, without a back-end database.
 
 ## How
