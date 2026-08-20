@@ -5,6 +5,8 @@ import {
   outputAlphabetEmoji
 } from "./alphabets.js";
 
+let qrGenerate, qrMode, qrCorrection;
+
 let domain = window.location.hostname;
 if (domain !== "ha.mr" && domain !== "www.ha.mr") {
   console.log(`This page is intended to be used on the ha.mr domain. You are currently on ${domain}.`);
@@ -52,46 +54,33 @@ const qrCodeImage = document.querySelector("#qrcode");
 const qrCodeCorrectionLevelContainer = document.querySelector("#qr-correct-level-container");
 const qrCodeCorrectionLevelElement = document.querySelector("#qr-correct-level");
 
-let qrCorrectionManuallySet = false;
-
-qrCodeCorrectionLevelElement.addEventListener("change", () => {
-  qrCorrectionManuallySet = true;
+qrCodeCorrectionLevelElement.addEventListener("input", () => {
   updateOutput();
 });
-
-function getOptimalErrorCorrectionLevel (text) {
-  const levels = ["M", "Q", "H"];
-
-  const baseVersion = QRCode.create(text, {
-    errorCorrectionLevel: levels[0]
-  }).version;
-
-  let optimalLevel = levels[0];
-
-  for (const level of levels.slice(1)) {
-    try {
-      const candidate = QRCode.create(text, {
-        errorCorrectionLevel: level
-      });
-
-      if (candidate.version > baseVersion) {
-        break;
-      }
-
-      optimalLevel = level;
-    } catch {
-      break;
-    }
-  }
-
-  return optimalLevel;
-}
 
 function updateOutput () {
   const input = inputLinkElement.value.trim();
   try {
     const alphabet = settings.emoji ? outputAlphabetEmoji : outputAlphabetASCII;
     const output = compress(input, alphabet);
+
+    // compress.js does not have support for non-http(s) protocols, nor credentials.
+    // previously it would silently strip them, but this block makes it reject instead
+    // additionally, invalid inputs the compressor would otherwise accept (like "http://") are rejected as well
+
+    // Regex: one or more word [a-zA-Z0-9_] characters, followed by ://. 
+    // Underscore is not valid but will get rejected by new URL() anyway
+    const hasProtocol = input.match(/\w+:\/\//); 
+    const url = new URL(hasProtocol ? input : "http://" + input);
+
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      throw new Error(`Invalid protocol: ${url.protocol}. Only http and https are supported.`);
+    }
+
+    if (url.username || url.password) {
+      throw new Error(`Credentials in URL are not supported`);
+    }
+
     let inputNormalized = input;
     const inputLower = input.toLowerCase();
     if (inputLower.startsWith("https://")) {
@@ -129,7 +118,18 @@ function updateOutput () {
     outputLinkElement.href = `http://${domain}#${output}`;
     outputLinkElement.style.color = "";
     if (settings.qr) {
-      const correctionLevels = ["L", "M", "Q", "H"];
+      // Lazyload the qr generator to avoid loading it on a redirect
+      if (!qrGenerate) {
+        import("./lean-qr/lean-qr.js").then((module) => {
+          qrGenerate = module.generate;
+          qrMode = module.mode;
+          qrCorrection = module.correction;
+          updateOutput();
+        });
+        return;
+      }
+
+      const correctionLevels = [qrCorrection.L, qrCorrection.M, qrCorrection.Q, qrCorrection.H];
 
       qrCodeImage.style.display = "inline";
       qrCodeCorrectionLevelContainer.style.display = "inline";
@@ -137,26 +137,31 @@ function updateOutput () {
       const qrCodeDomain = domain.toUpperCase();
       const qrCodeLink = `HTTP://${qrCodeDomain}/${compress(input, outputAlphabetQR)}`;
 
-      if (!qrCorrectionManuallySet) {
-        const optimalLevel = getOptimalErrorCorrectionLevel(qrCodeLink);
-        qrCodeCorrectionLevelElement.value = correctionLevels.indexOf(optimalLevel);
-      }
+      const errorCorrection = correctionLevels[qrCodeCorrectionLevelElement.value];
 
-      const errorCorrection =
-        correctionLevels[qrCodeCorrectionLevelElement.value];
+      const qr = qrGenerate(
+        qrMode.alphaNumeric(qrCodeLink),
+        {
+          minVersion: 1,
+          maxVersion: 40,
+          minCorrectionLevel: errorCorrection,
+          // Lean-qr will choose the highest ECC that will fit in the smallest version, between minCorrectionLevel and maxCorrectionLevel
+          maxCorrectionLevel: qrCorrection.H,
+        });
 
-      QRCode.toDataURL(qrCodeLink, {
-        errorCorrectionLevel: errorCorrection,
-        scale: 8
-      }, (err, url) => {
-        if (err) {
-          qrCodeImage.style.display = "none";
-          qrCodeCorrectionLevelContainer.style.display = "none";
-          return;
+      qr.toCanvas(qrCodeImage,
+        {
+          on:  [0x00, 0x00, 0x00, 0xFF], // black
+          off: [0xFF, 0xFF, 0xFF, 0xFF], // white
+          pad: 2,
         }
-        qrCodeImage.src = url;
-        qrCodeImage.title = qrCodeLink;
-      });
+      );
+      // Set image width to qr version size + 4px per side padding, scale by 8
+      // Otherwise the output will be at 1px scale and impossible to see.
+      qrCodeImage.style.width = `${(qr.size + 8) * 8}px`;
+      qrCodeImage.style.height = `${(qr.size + 8) * 8}px`;
+      qrCodeImage.title = qrCodeLink;
+
     } else {
       qrCodeImage.style.display = "none";
       qrCodeCorrectionLevelContainer.style.display = "none";
@@ -177,8 +182,18 @@ function updateOutput () {
   }
 }
 
+const redirectContainerElement = document.querySelector("#redirect-container");
+const redirectLinkElement = document.querySelector("#redirect-link");
+const loaderElement = document.querySelector("#loader");
+
+function handleRedirectPrompt (target) {
+  loaderElement.style.display = "none";
+  redirectContainerElement.style.display = "flex";
+  redirectLinkElement.textContent = target;
+  redirectLinkElement.href = target;
+}
+
 inputLinkElement.addEventListener("input", () => {
-  qrCorrectionManuallySet = false;
   updateOutput();
 });
 
@@ -205,7 +220,7 @@ inputLinkElement.addEventListener("input", () => {
   if (payload && payload.trim()) {
     try {
       const target = decompress(payload, alphabet);
-      window.location.href = target;
+      handleRedirectPrompt(target);
       return;
     } catch (e) {
       console.warn(`Redirect failed. Could not decode input.`);
@@ -215,8 +230,10 @@ inputLinkElement.addEventListener("input", () => {
 
   updateOutput();
 
-  document.querySelector("#loader").style.opacity = 0;
+  loaderElement.style.opacity = 0;
   document.querySelector("#content").style.opacity = 1;
   document.querySelector("#content").style.pointerEvents = "auto";
+  document.querySelector("header").style.opacity = 1;
+  document.querySelector("header").style.pointerEvents = "auto";
 
 })();
